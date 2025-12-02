@@ -10,6 +10,7 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 import torch
 import torch.nn as nn
 from torchvision import transforms
+from torchvision.models import resnet18, ResNet18_Weights
 from PIL import Image, ImageTk
 import numpy as np
 import cv2
@@ -56,7 +57,7 @@ class OcclusionCNN(nn.Module):
         return x
 
 class ConvAE(nn.Module):
-    """Autoencoder per anomaly detection."""
+    """Autoencoder per anomaly detection (LEGACY - non più usato)."""
     def __init__(self):
         super(ConvAE, self).__init__()
         self.encoder = nn.Sequential(
@@ -80,6 +81,57 @@ class ConvAE(nn.Module):
         encoded = self.encoder(x)
         decoded = self.decoder(encoded)
         return decoded
+
+# ============================================================================
+# MODELLI EFFICIENTAD-M (nuovo sistema)
+# ============================================================================
+
+class Teacher(nn.Module):
+    """
+    Teacher: ResNet18 pre-addestrato su ImageNet (congelato).
+    Usato per estrarre feature di riferimento.
+    """
+    def __init__(self):
+        super(Teacher, self).__init__()
+        # Carica ResNet18 pre-addestrato
+        base = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        # Rimuovi layer finali (avgpool e fc), mantieni solo encoder
+        self.encoder = nn.Sequential(*list(base.children())[:-2])
+        
+        # Congela tutti i parametri (no training)
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+    
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor [B, 3, H, W]
+        Returns:
+            feature_map: Tensor [B, 512, Hf, Wf] dove Hf=H/32, Wf=W/32
+        """
+        return self.encoder(x)
+
+
+class Student(nn.Module):
+    """
+    Student: ResNet18 NON pre-addestrato (pesi random).
+    Addestrato per imitare le feature del Teacher su immagini OK.
+    """
+    def __init__(self):
+        super(Student, self).__init__()
+        # Carica ResNet18 SENZA pesi pre-addestrati
+        base = resnet18(weights=None)
+        # Rimuovi layer finali (avgpool e fc), mantieni solo encoder
+        self.encoder = nn.Sequential(*list(base.children())[:-2])
+    
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor [B, 3, H, W]
+        Returns:
+            feature_map: Tensor [B, 512, Hf, Wf] dove Hf=H/32, Wf=W/32
+        """
+        return self.encoder(x)
 
 # ============================================================================
 # FUNZIONI PREPROCESSING
@@ -288,7 +340,7 @@ def preprocess_image(image_path, device=None):
     return image_tensor
 
 def preprocess_image_for_ae(image_path, device=None):
-    """Preprocessa immagine per autoencoder."""
+    """Preprocessa immagine per autoencoder (LEGACY)."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     transform = transforms.Compose([
@@ -306,14 +358,43 @@ def preprocess_image_for_ae(image_path, device=None):
     image_tensor = image_tensor.unsqueeze(0).to(device)
     return image_tensor
 
-def classify_connector(image_path, connector_name, occ_model, ae_models_dict, device=None):
+def preprocess_image_for_efficientad(image_path, device=None):
+    """Preprocessa immagine per EfficientAD-M (normalizzazione ImageNet)."""
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    transform = transforms.Compose([
+        transforms.Resize((128, 128)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    # Carica immagine (può essere grayscale o RGB)
+    image = Image.open(image_path)
+    # Se è grayscale, converti in RGB
+    if image.mode == 'L':
+        image = image.convert('RGB')
+    elif image.mode != 'RGB':
+        image = image.convert('RGB')
+    image_tensor = transform(image)
+    image_tensor = image_tensor.unsqueeze(0).to(device)
+    return image_tensor
+
+def classify_connector(image_path, connector_name, occ_model, efficientad_models_dict, device=None, use_efficientad=True):
     """Classifica un connettore come OK, KO o OCCLUSION.
     
+    Args:
+        image_path: Path all'immagine o array numpy
+        connector_name: Nome del connettore (conn1, conn2, ...)
+        occ_model: Modello per classificazione OCCLUSION
+        efficientad_models_dict: Dizionario con modelli EfficientAD-M {connector_name: (teacher, student, threshold)}
+        device: Device PyTorch
+        use_efficientad: Se True usa EfficientAD-M, altrimenti autoencoder (legacy)
+    
     Returns:
-        (label, error, heatmap, reconstructed): label è "OK", "KO" o "OCCLUSION", 
-                                                error è l'errore medio di ricostruzione,
-                                                heatmap è un array numpy [H, W] con errore per pixel (None se OCCLUSION),
-                                                reconstructed è l'immagine ricostruita [H, W, 3] (None se OCCLUSION)
+        (label, score, heatmap, reconstructed): 
+            - label: "OK", "KO" o "OCCLUSION"
+            - score: Anomaly score (errore per autoencoder, differenza feature per EfficientAD-M)
+            - heatmap: Array numpy [H, W] con heatmap (None se OCCLUSION)
+            - reconstructed: None (non usato con EfficientAD-M)
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -327,34 +408,58 @@ def classify_connector(image_path, connector_name, occ_model, ae_models_dict, de
     if pred_vis == 0:  # OCCLUSION
         return "OCCLUSION", 0.0, None, None
     
-    # STEP 2: Anomaly detection (usa il modello specifico per questo connettore)
-    if connector_name not in ae_models_dict:
+    # STEP 2: Anomaly detection
+    if connector_name not in efficientad_models_dict:
         raise ValueError(f"Modello non trovato per {connector_name}")
     
-    ae_model, threshold = ae_models_dict[connector_name]
-    
-    x_ae = preprocess_image_for_ae(image_path, device)
-    with torch.no_grad():
-        reconstructed = ae_model(x_ae)
-        # Calcola errore come nel training: MSE con reduction='none', poi media su [C, H, W]
-        # Questo è identico a come viene calcolato nel calculate_threshold
-        criterion = nn.MSELoss(reduction='none')
-        batch_errors = criterion(reconstructed, x_ae)
-        # Media su canali RGB: [1, 3, H, W] -> [1, H, W]
-        pixel_errors = batch_errors.mean(dim=1)  # Media sui canali RGB
-        # Media spaziale per errore totale: [1, H, W] -> scalare
-        error = pixel_errors.mean().item()
-        # Heatmap: [1, H, W] -> [H, W] (numpy)
-        heatmap = pixel_errors.squeeze(0).cpu().numpy()
-        # Immagine ricostruita: [1, 3, H, W] -> [H, W, 3] (numpy, uint8)
-        reconstructed_np = reconstructed.squeeze(0).cpu().numpy()
-        reconstructed_np = np.transpose(reconstructed_np, (1, 2, 0))  # [H, W, 3]
-        reconstructed_np = (reconstructed_np * 255).astype(np.uint8)
-    
-    if error > threshold:
-        return "KO", error, heatmap, reconstructed_np
+    if use_efficientad:
+        # Usa EfficientAD-M
+        teacher, student, threshold = efficientad_models_dict[connector_name]
+        
+        x_eff = preprocess_image_for_efficientad(image_path, device)
+        with torch.no_grad():
+            # Feature Teacher e Student
+            t_feat = teacher(x_eff)
+            s_feat = student(x_eff)
+            
+            # Differenza feature (anomaly map)
+            diff = (t_feat - s_feat) ** 2
+            # Media sui canali: [B, C, H, W] -> [B, H, W]
+            amap = diff.mean(dim=1)
+            # Score immagine = max su tutta la feature map
+            score = amap.flatten(1).max(1)[0].cpu().item()
+            
+            # Heatmap: upsample amap alla dimensione originale (128x128)
+            # amap è [B, Hf, Wf] dove Hf=H/32, Wf=W/32 (circa 4x4 per 128x128 input)
+            amap_np = amap.squeeze(0).cpu().numpy()  # [Hf, Wf]
+            # Upsample a 128x128
+            import cv2
+            heatmap = cv2.resize(amap_np, (128, 128), interpolation=cv2.INTER_LINEAR)
+        
+        if score > threshold:
+            return "KO", score, heatmap, None
+        else:
+            return "OK", score, heatmap, None
     else:
-        return "OK", error, heatmap, reconstructed_np
+        # Legacy: usa autoencoder
+        ae_model, threshold = efficientad_models_dict[connector_name]
+        
+        x_ae = preprocess_image_for_ae(image_path, device)
+        with torch.no_grad():
+            reconstructed = ae_model(x_ae)
+            criterion = nn.MSELoss(reduction='none')
+            batch_errors = criterion(reconstructed, x_ae)
+            pixel_errors = batch_errors.mean(dim=1)
+            error = pixel_errors.mean().item()
+            heatmap = pixel_errors.squeeze(0).cpu().numpy()
+            reconstructed_np = reconstructed.squeeze(0).cpu().numpy()
+            reconstructed_np = np.transpose(reconstructed_np, (1, 2, 0))
+            reconstructed_np = (reconstructed_np * 255).astype(np.uint8)
+        
+        if error > threshold:
+            return "KO", error, heatmap, reconstructed_np
+        else:
+            return "OK", error, heatmap, reconstructed_np
 
 # ============================================================================
 # INTERFACCIA GRAFICA
@@ -373,8 +478,9 @@ class BekoDetectionSystem:
         self.connectors = []
         self.results = []
         self.occ_model = None
-        self.ae_models = {}  # Dizionario: connector_name -> (model, threshold)
-        self.threshold = None
+        self.ae_models = {}  # Dizionario: connector_name -> (model, threshold) - LEGACY
+        self.efficientad_models = {}  # Dizionario: connector_name -> (teacher, student, threshold)
+        self.use_efficientad = True  # Usa EfficientAD-M invece di autoencoder
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # Paths
@@ -541,7 +647,7 @@ class BekoDetectionSystem:
         self.canvas.draw()
     
     def load_models(self):
-        """Carica i modelli addestrati (9 modelli AE, uno per connettore)."""
+        """Carica i modelli addestrati (EfficientAD-M o autoencoder legacy)."""
         try:
             self.status_label.config(text="Caricamento modelli...", fg='yellow')
             self.root.update()
@@ -555,67 +661,110 @@ class BekoDetectionSystem:
             self.occ_model.load_state_dict(torch.load(occ_path, map_location=self.device))
             self.occ_model.eval()
             
-            # Carica 9 modelli AE (uno per connettore)
+            # Prova prima a caricare EfficientAD-M
             connectors = [f"conn{i}" for i in range(1, 10)]
-            loaded = 0
+            loaded_eff = 0
             
             for connector_name in connectors:
-                ae_path = self.models_dir / f"ae_conv_{connector_name}.pth"
-                threshold_path = self.models_dir / f"ae_threshold_{connector_name}.npy"
+                student_path = self.models_dir / f"efficientad_student_{connector_name}.pth"
+                threshold_path = self.models_dir / f"efficientad_threshold_{connector_name}.npy"
                 
-                if ae_path.exists() and threshold_path.exists():
-                    model = ConvAE().to(self.device)
-                    model.load_state_dict(torch.load(ae_path, map_location=self.device))
-                    model.eval()
+                if student_path.exists() and threshold_path.exists():
+                    # Carica Teacher (sempre lo stesso, pre-addestrato)
+                    teacher = Teacher().to(self.device)
+                    teacher.eval()
+                    
+                    # Carica Student
+                    student = Student().to(self.device)
+                    student.load_state_dict(torch.load(student_path, map_location=self.device))
+                    student.eval()
+                    
+                    # Carica threshold
                     threshold = np.load(threshold_path)
-                    self.ae_models[connector_name] = (model, threshold)
-                    loaded += 1
+                    
+                    self.efficientad_models[connector_name] = (teacher, student, threshold)
+                    loaded_eff += 1
                 else:
-                    print(f"⚠️  Modello non trovato per {connector_name}")
+                    print(f"⚠️  Modello EfficientAD non trovato per {connector_name}")
             
-            if loaded == 0:
-                # Fallback: prova a caricare il vecchio modello unico
-                ae_path = self.models_dir / "ae_conv.pth"
-                threshold_path = self.models_dir / "ae_threshold.npy"
-                if ae_path.exists() and threshold_path.exists():
-                    print("⚠️  Usando modello unico (vecchio formato)")
-                    model = ConvAE().to(self.device)
-                    model.load_state_dict(torch.load(ae_path, map_location=self.device))
-                    model.eval()
-                    threshold = np.load(threshold_path)
-                    # Usa lo stesso modello per tutti i connettori
-                    for connector_name in connectors:
+            if loaded_eff > 0:
+                # Usa EfficientAD-M
+                self.use_efficientad = True
+                self.status_label.config(text=f"✅ Modelli caricati ({loaded_eff} EfficientAD-M)", fg='#00ff00')
+                print(f"✅ Caricati {loaded_eff} modelli EfficientAD-M")
+            else:
+                # Fallback: prova autoencoder (legacy)
+                print("⚠️  EfficientAD-M non trovato, provo autoencoder...")
+                self.use_efficientad = False
+                loaded_ae = 0
+                
+                for connector_name in connectors:
+                    ae_path = self.models_dir / f"ae_conv_{connector_name}.pth"
+                    threshold_path = self.models_dir / f"ae_threshold_{connector_name}.npy"
+                    
+                    if ae_path.exists() and threshold_path.exists():
+                        model = ConvAE().to(self.device)
+                        model.load_state_dict(torch.load(ae_path, map_location=self.device))
+                        model.eval()
+                        threshold = np.load(threshold_path)
                         self.ae_models[connector_name] = (model, threshold)
-                    loaded = len(connectors)
-                else:
-                    raise FileNotFoundError("Nessun modello AE trovato (né per connettore né unico)")
-            
-            self.status_label.config(text=f"✅ Modelli caricati ({loaded} AE)", fg='#00ff00')
-            print(f"✅ Caricati {loaded} modelli AE")
+                        loaded_ae += 1
+                
+                if loaded_ae == 0:
+                    # Fallback: modello unico
+                    ae_path = self.models_dir / "ae_conv.pth"
+                    threshold_path = self.models_dir / "ae_threshold.npy"
+                    if ae_path.exists() and threshold_path.exists():
+                        print("⚠️  Usando modello unico (vecchio formato)")
+                        model = ConvAE().to(self.device)
+                        model.load_state_dict(torch.load(ae_path, map_location=self.device))
+                        model.eval()
+                        threshold = np.load(threshold_path)
+                        for connector_name in connectors:
+                            self.ae_models[connector_name] = (model, threshold)
+                        loaded_ae = len(connectors)
+                    else:
+                        raise FileNotFoundError("Nessun modello trovato (né EfficientAD-M né autoencoder)")
+                
+                self.status_label.config(text=f"✅ Modelli caricati ({loaded_ae} AE legacy)", fg='#00ff00')
+                print(f"✅ Caricati {loaded_ae} modelli AE (legacy)")
         except Exception as e:
             messagebox.showerror("Errore", f"Errore caricamento modelli:\n{e}")
+            self.status_label.config(text="❌ Errore caricamento modelli", fg='red')
     
     def print_threshold_info(self):
         """Stampa informazioni sui thresholds per debug."""
-        if self.ae_models:
-            print(f"\n{'='*60}")
-            print(f"🔍 INFORMAZIONI SUL SISTEMA DI CLASSIFICAZIONE")
-            print(f"{'='*60}")
-            print(f"\n📊 THRESHOLDS AUTOENCODER (per connettore):")
+        print(f"\n{'='*60}")
+        print(f"🔍 INFORMAZIONI SUL SISTEMA DI CLASSIFICAZIONE")
+        print(f"{'='*60}")
+        
+        if self.use_efficientad and self.efficientad_models:
+            print(f"\n📊 THRESHOLDS EFFICIENTAD-M (per connettore):")
+            for conn_name, (_, _, threshold) in sorted(self.efficientad_models.items()):
+                print(f"  {conn_name}: {threshold:.6f}")
+            print(f"\n📝 COME FUNZIONA:")
+            print(f"  1. STEP 1 - Classificatore OCCLUSION vs VISIBLE:")
+            print(f"     • Se OCCLUSION → ritorna 'OCCLUSION'")
+            print(f"     • Se VISIBLE → procede a STEP 2")
+            print(f"\n  2. STEP 2 - EfficientAD-M per Anomaly Detection:")
+            print(f"     • Teacher: ResNet18 pre-addestrato (congelato)")
+            print(f"     • Student: ResNet18 addestrato SOLO su immagini OK")
+            print(f"     • Anomaly score: differenza tra feature Teacher e Student (max)")
+            print(f"     • Usa il threshold specifico del connettore per decidere OK/KO")
+        elif self.ae_models:
+            print(f"\n📊 THRESHOLDS AUTOENCODER (per connettore) - LEGACY:")
             for conn_name, (_, threshold) in sorted(self.ae_models.items()):
                 print(f"  {conn_name}: {threshold:.6f}")
             print(f"\n📝 COME FUNZIONA:")
             print(f"  1. STEP 1 - Classificatore OCCLUSION vs VISIBLE:")
             print(f"     • Se OCCLUSION → ritorna 'OCCLUSION'")
             print(f"     • Se VISIBLE → procede a STEP 2")
-            print(f"\n  2. STEP 2 - Autoencoder per Anomaly Detection:")
+            print(f"\n  2. STEP 2 - Autoencoder per Anomaly Detection (LEGACY):")
             print(f"     • Ogni connettore ha il suo autoencoder addestrato SOLO su immagini OK")
             print(f"     • Calcola errore di ricostruzione (MSE tra input e output)")
             print(f"     • Usa il threshold specifico del connettore per decidere OK/KO")
-            print(f"\n⚠️  NOTA: Se molti KO vengono classificati come OK,")
-            print(f"     i thresholds potrebbero essere troppo alti.")
-            print(f"     Verifica gli errori di ricostruzione nella visualizzazione.")
-            print(f"{'='*60}\n")
+        
+        print(f"{'='*60}\n")
     
     def on_drop(self, event):
         """Gestisce il drag & drop."""
@@ -688,12 +837,20 @@ class BekoDetectionSystem:
                 # Salva crop normalizzato (grayscale) come in Data/connectors/
                 cv2.imwrite(str(temp_path), conn['crop'])
                 
-                label, error, heatmap, reconstructed = classify_connector(
-                    str(temp_path), conn['name'], self.occ_model, self.ae_models, self.device
-                )
-                
-                # Ottieni threshold per questo connettore
-                threshold = self.ae_models.get(conn['name'], (None, None))[1] if conn['name'] in self.ae_models else None
+                # Usa EfficientAD-M o autoencoder (legacy)
+                if self.use_efficientad:
+                    label, score, heatmap, reconstructed = classify_connector(
+                        str(temp_path), conn['name'], self.occ_model, 
+                        self.efficientad_models, self.device, use_efficientad=True
+                    )
+                    threshold = self.efficientad_models.get(conn['name'], (None, None, None))[2] if conn['name'] in self.efficientad_models else None
+                    error = score  # Per compatibilità con il codice esistente
+                else:
+                    label, error, heatmap, reconstructed = classify_connector(
+                        str(temp_path), conn['name'], self.occ_model, 
+                        self.ae_models, self.device, use_efficientad=False
+                    )
+                    threshold = self.ae_models.get(conn['name'], (None, None))[1] if conn['name'] in self.ae_models else None
                 
                 self.results.append({
                     'name': conn['name'],
