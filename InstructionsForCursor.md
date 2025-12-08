@@ -1,224 +1,177 @@
-Perfetto, allora ora facciamo il “secondo step” per Cursor, usando il **JSON `Training/pcl_roi_config.json`** invece del dizionario hardcoded.
 
-Incolla questo prompt in una nuova chat di Cursor (stesso repo del notebook `step2_efficientad_per_connector.ipynb`):
-
----
-
-### Prompt per Cursor (uso ROI da JSON + mask più forte + debug raw/masked)
+### Prompt per Cursor – nuovo `crop_connectors_rgb.py` + update notebook
 
 ````text
-We are working on the notebook:
+We are working in the connectors anomaly detection repo.
 
-- `step2_efficientad_per_connector.ipynb`
+There is already a script:
 
-Context (already implemented):
-- Teacher–Student ResNet18 EfficientAD-style
-- multi-layer features (e.g. layer2/layer3/layer4)
-- one model per connector
-- spatial weight mask per connector from OK variance
-- robust anomaly score based on a fused anomaly map
+- `Codice/crop_connectors.py`
 
-NOW:
-I have created a JSON file with manual PCL ROIs for each connector:
+that:
+- reads aligned images (top view),
+- uses a ROI config JSON to crop each connector,
+- normalizes the crops,
+- and saves grayscale PNGs in `Data/connectors/...` (Conn1, Conn2, etc.).
 
-- `Training/pcl_roi_config.json`
+I want to ADD a NEW script, without breaking the existing grayscale pipeline:
 
-with this structure:
+- `Codice/crop_connectors_rgb.py`
 
-```json
-{
-  "conn1": [y1, y2, x1, x2],
-  "conn2": [y1, y2, x1, x2],
-  ...
-}
+that will:
+- take the aligned top images from: `Data/aligned_top`   (if the actual path has a slightly different name that already exists in the repo, use that one),
+- use the SAME ROI logic as `crop_connectors.py` (same JSON, same iteration over connectors),
+- but produce **RGB crops** instead of grayscale,
+- and save them in a PARALLEL folder:
+
+- input:  `Data/aligned_top`
+- output: `Data/connectors_rgb/Conn1`, `Data/connectors_rgb/Conn2`, ...
+
+with the same file naming convention used in `Data/connectors`.
+
+---
+
+## 1. New script `crop_connectors_rgb.py`
+
+Create a new file `Codice/crop_connectors_rgb.py` by reusing as much as possible from `crop_connectors.py`, but:
+
+1. Keep the same CLI arguments and overall structure:
+   - `--input-dir`
+   - `--output-dir`
+   - `--roi-config`
+   - `--margin`
+   - logging / progress printing
+   - the per-connector loop that builds subfolders like `Conn1`, `Conn2`, etc.
+
+2. Use the same ROI JSON and cropping logic:
+   - Reuse the helper that reads ROI config (or reimplement the same logic).
+   - Use the same mapping between connector names and ROI entries (e.g. conn1, conn2, etc.).
+   - The only difference is how the ROI is normalized and saved (RGB vs grayscale).
+
+3. Implement a new `normalize_roi(img: np.ndarray) -> np.ndarray` with this behavior:
+   - Input: `img` is a **BGR** ROI from OpenCV, 3-channel.
+   - We want to keep full color information, but slightly normalize illumination on the luminance channel only.
+   - Suggested implementation:
+
+   ```python
+   def normalize_roi(img: np.ndarray) -> np.ndarray:
+       """
+       Keep color information, apply light illumination normalization on the ROI
+       and return float32 in [0, 1] with 3 channels (BGR).
+       """
+       # Work in LAB to adjust only luminance
+       lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+       l, a, b = cv2.split(lab)
+
+       # Light CLAHE (we already have alignment pre-processing upstream)
+       clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+       l_eq = clahe.apply(l)
+
+       lab_eq = cv2.merge((l_eq, a, b))
+       bgr_eq = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
+
+       # Normalize to [0, 1] with 3 channels
+       normalized = bgr_eq.astype(np.float32) / 255.0
+       return normalized
 ````
 
-Coordinates are in image space (0..127).
+* Then, when saving:
 
-I want you to:
+  * convert back to uint8: `(normalized * 255).astype(np.uint8)`
+  * and write PNG **in color** (3 channels) with `cv2.imwrite`.
 
-1. Load this JSON once and use it to override the spatial masks (strong focus on PCL).
-2. Make the spatial mask more aggressive (strong suppression outside the ROI).
-3. Add a debug function to compare RAW vs MASKED anomaly maps for one OK and one KO image.
+4. The main entry point should allow running:
 
-Please do NOT change the overall training and scoring logic, only the mask and debug parts.
+   ```bash
+   python Codice/crop_connectors_rgb.py \
+       --input-dir "Data/aligned_top" \
+       --output-dir "Data/connectors_rgb" \
+       --roi-config "Codice/roi_config.json" \
+       --margin 8
+   ```
 
----
+   * Use `margin=8` as default if appropriate (or keep the same default as in `crop_connectors.py`).
+   * For each connector ID, create a subfolder under `Data/connectors_rgb` with the SAME naming convention as the grayscale version (`Conn1`, `Conn2`, etc.) so the layout mirrors `Data/connectors`.
 
-## A) LOAD ROI CONFIG JSON (GLOBAL)
+5. Do NOT modify `crop_connectors.py`.
 
-At the top of the notebook (after imports), add:
-
-```python
-import json
-
-PCL_ROI_CONFIG_PATH = "Training/pcl_roi_config.json"
-
-try:
-    with open(PCL_ROI_CONFIG_PATH, "r") as f:
-        PCL_ROI_CONFIG = json.load(f)
-    print(f"[ROI] Loaded PCL ROI config from {PCL_ROI_CONFIG_PATH}")
-except FileNotFoundError:
-    PCL_ROI_CONFIG = {}
-    print(f"[ROI] WARNING: {PCL_ROI_CONFIG_PATH} not found. No manual ROIs will be used.")
-```
-
-So we have a global dict:
-
-* `PCL_ROI_CONFIG[connector_name] = [y1, y2, x1, x2]` if available.
+   * The grayscale pipeline must remain available.
+   * The new RGB pipeline is an alternative living in `crop_connectors_rgb.py`.
 
 ---
 
-## B) STRONGER SPATIAL MASK + ROI OVERRIDE
+## 2. Update the notebook to use RGB connectors
 
-Near the mask code, define global mask bounds:
+Now update the notebook responsible for EfficientAD-style training:
 
-```python
-MASK_MIN_WEIGHT = 0.1   # strong suppression outside ROI
-MASK_MAX_WEIGHT = 2.0   # strong emphasis inside ROI
-```
+* `step2_efficientad_per_connector.ipynb`
 
-Then modify `compute_spatial_weight_mask_for_connector(...)` as follows:
+Currently it loads grayscale crops from `Data/connectors/...` and builds datasets / dataloaders accordingly.
 
-1. Keep the existing logic that computes `weights` from OK variance (std → normalized → inverted → scaled).
-2. After you obtain the initial `weights` array, add:
+I want to switch this notebook to use the NEW RGB crops under:
 
-```python
-# Log the range before ROI override
-print(f"[MASK] {connector_name}: variance-based weights range = ({weights.min():.3f}, {weights.max():.3f})")
-```
+* `Data/connectors_rgb/...` (same subfolder structure: Conn1, Conn2, …)
 
-3. Then, if the connector has a manual ROI in `PCL_ROI_CONFIG`, override the mask completely:
+Tasks:
 
-```python
-if connector_name in PCL_ROI_CONFIG:
-    y1, y2, x1, x2 = PCL_ROI_CONFIG[connector_name]
-    roi_mask = np.full_like(weights, MASK_MIN_WEIGHT, dtype=np.float32)
-    # Clamp coordinates
-    h, w = roi_mask.shape
-    y1 = max(0, min(h, y1))
-    y2 = max(0, min(h, y2))
-    x1 = max(0, min(w, x1))
-    x2 = max(0, min(w, x2))
-    roi_mask[y1:y2, x1:x2] = MASK_MAX_WEIGHT
-    weights = roi_mask
-    print(f"[MASK] Applied manual PCL ROI override for {connector_name} with coords (y1={y1}, y2={y2}, x1={x1}, x2={x2})")
-```
+1. Locate where the dataset paths are defined:
 
-4. Finally, save `weights` as before (`spatial_mask_{connector_name}.npy`) and use it everywhere else exactly as you already do.
+   * Anywhere the code currently points to `Data/connectors` (or equivalent).
+   * Replace these paths to point to `Data/connectors_rgb` instead.
 
-This way:
+2. Check the image loading code:
 
-* If a ROI is defined in the JSON → ONLY the ROI geometry matters (PCL zone is strongly emphasized, rest heavily suppressed).
-* If not defined → fallback to variance-based mask.
+   * If it uses OpenCV, make sure images are read in color (e.g. `cv2.IMREAD_COLOR`) and converted to RGB if needed.
+   * If it uses PIL, ensure `.convert("RGB")` is applied.
+   * Remove any explicit conversion to grayscale or channel squeezing (`unsqueeze(0)`, etc.).
 
----
+3. Make sure the tensors are **3-channel**:
 
-## C) DEBUG FUNCTION: RAW vs MASKED ANOMALY MAP (OK + KO)
+   * After transforms, the shape for a single image should be `(3, H, W)` instead of `(1, H, W)`.
+   * Remove any code that assumes a single channel (e.g. concatenation like `x = x.repeat(3, 1, 1)` to feed a 1-channel image into a ResNet). That should not be needed anymore since we now have true RGB.
 
-I want a visualization to see how much the mask changes the anomaly maps.
+4. Normalization parameters:
 
-Add a function, for example:
+   * If the code uses a normalization transform with mean/std for grayscale (single value), update it to 3-channel values.
+   * For now you can use ImageNet-style normalization as a reasonable default:
 
-```python
-def debug_compare_raw_vs_masked_anomaly_map(
-    connector_name,
-    csv_path="data/dataset.csv",
-    ko_labels=("KO",),
-    models_dir="models",
-    topk_percent=0.01
-):
-    """
-    - Load one OK and one KO image for the given connector_name.
-      * OK: label == "OK"
-      * KO: label in ko_labels (ignore 'OCCLUSION' / 'PARTIAL OCCLUSION' etc.)
-    - For each image:
-        1. Load original RGB image (128x128 for display).
-        2. Run Teacher + Student to get multi-layer teacher_feats and student_feats.
-        3. Compute fused anomaly map WITHOUT spatial mask (amap_raw).
-        4. Compute fused anomaly map WITH spatial mask (amap_masked).
-        5. Upsample both maps to image resolution (IMG_SIZE x IMG_SIZE).
-        6. Normalize each map separately to [0,1] for visualization.
-        7. Compute scalar anomaly scores from amap_raw and amap_masked (using the same top-k or pooling method used in the scoring function).
-    - Plot a 2x3 matplotlib figure:
-        Row 1: OK image, OK amap_raw, OK amap_masked.
-        Row 2: KO image, KO amap_raw, KO amap_masked.
-    - Print to console:
-        * min/max of the spatial mask used
-        * scalar scores (raw vs masked) for OK and KO
-    """
-```
+   ```python
+   transforms.Normalize(
+       mean=[0.485, 0.456, 0.406],
+       std=[0.229, 0.224, 0.225],
+   )
+   ```
 
-Implementation hints:
+   * Apply this after converting to tensor in the usual way.
 
-* Reuse the existing fused anomaly map logic you already have (the same code path that `compute_anomaly_score_from_features` uses, but:
+5. Make sure the EfficientAD / ResNet backbone is still expecting 3-channel input:
 
-  * for `amap_raw`, skip applying the spatial mask.
-  * for `amap_masked`, apply it as usual.
+   * ResNet18 default expects 3 channels, so as long as we provide `(3, H, W)` it should work without further changes.
+   * Remove any workaround that was there just to adapt grayscale to 3-channel (e.g. repeating the single channel).
 
-* For image loading:
+6. Debug plots:
 
-  * use `PIL.Image.open(image_path).convert("RGB")`
-  * resize to `(IMG_SIZE, IMG_SIZE)` for consistent visualization.
+   * Where the notebook currently visualizes:
 
-* For upsampling maps:
+     * `OK Raw Anomaly`, `KO Raw Anomaly`,
+     * `OK Masked Anomaly`, `KO Masked Anomaly`,
+     * and the corresponding input crops,
+   * Make sure the image show functions handle RGB correctly (no accidental `cmap="gray"` for the input crops).
+   * It is fine to leave anomaly maps as 2D heatmaps with color map, but the input crops should be shown in true color.
 
-  ```python
-  amap_raw_up = F.interpolate(amap_raw, size=(IMG_SIZE, IMG_SIZE), mode="bilinear", align_corners=False)
-  amap_masked_up = F.interpolate(amap_masked, size=(IMG_SIZE, IMG_SIZE), mode="bilinear", align_corners=False)
-  ```
+7. At the end of the notebook, add/update a short markdown cell that explains:
 
-* For normalization:
-
-  ```python
-  def normalize_map(m):
-      m = m - m.min()
-      if m.max() > 0:
-          m = m / m.max()
-      return m
-  ```
-
-* For plotting:
-
-  ```python
-  fig, axes = plt.subplots(2, 3, figsize=(12, 8))
-  # row 0: OK
-  axes[0,0].imshow(ok_img); axes[0,0].set_title("OK image"); axes[0,0].axis("off")
-  axes[0,1].imshow(ok_raw_norm, cmap="jet"); axes[0,1].set_title("OK raw anomaly"); axes[0,1].axis("off")
-  axes[0,2].imshow(ok_masked_norm, cmap="jet"); axes[0,2].set_title("OK masked anomaly"); axes[0,2].axis("off")
-  # row 1: KO
-  ...
-  plt.tight_layout()
-  ```
-
-At the end of the notebook, add an example cell:
-
-```python
-# Example manual debug (I will call this for specific connectors):
-# debug_compare_raw_vs_masked_anomaly_map("conn2")
-```
+   * We are now using **RGB connector crops** from `Data/connectors_rgb/ConnX/...`
+   * The crops are generated by `Codice/crop_connectors_rgb.py` using LAB + CLAHE on the luminance channel but preserving color.
+   * The model now receives 3-channel input, and normalization uses ImageNet-like mean/std.
 
 ---
 
-## D) CONSTRAINTS
+Please:
 
-* Do NOT modify the main training loop or the threshold computation logic (except that they now use the new spatial masks).
-* Assume that the training and scoring pipeline already handles:
-
-  * Teacher–Student
-  * multi-layer features
-  * spatial mask loading from `spatial_mask_{connector}.npy`.
-
-Just:
-
-* load `Training/pcl_roi_config.json`,
-* override the masks based on these ROIs,
-* strengthen out-of-ROI suppression (MASK_MIN_WEIGHT),
-* and add the debug RAW vs MASKED anomaly visualization.
+* First, implement `crop_connectors_rgb.py` as described, reusing as much logic as possible from `crop_connectors.py`.
+* Then update the notebook `step2_efficientad_per_connector.ipynb` to read from `Data/connectors_rgb` and handle 3-channel RGB tensors in the whole pipeline.
+* Keep everything clean, well commented, and do not break the existing grayscale scripts.
 
 ```
 
----
-
-Con questo Cursor userà il JSON che hai fatto con il tool delle ROI, applicherà la mask fortissima sul PCL, e ti darà anche il confronto visivo tra mappa grezza e mappa pesata: così capisci subito se ha smesso di fissarsi sui cavi e ha iniziato a guardare dove deve.
-```
