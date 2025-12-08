@@ -18,6 +18,8 @@ import json
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.patches import Rectangle
+from matplotlib.colors import LinearSegmentedColormap
+from scipy import ndimage
 from pathlib import Path
 from dataclasses import dataclass
 import tempfile
@@ -93,8 +95,32 @@ class Teacher(nn.Module):
     """
     def __init__(self):
         super(Teacher, self).__init__()
-        # Carica ResNet18 pre-addestrato
-        base = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        # Carica ResNet18 pre-addestrato con gestione errori SSL
+        try:
+            # Prova a caricare con pesi pre-addestrati
+            base = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        except Exception as e:
+            # Se fallisce (es. errore SSL), prova senza verifica SSL
+            import ssl
+            import urllib.request
+            print(f"⚠️  Errore caricamento pesi pre-addestrati: {e}")
+            print("   Tentativo con verifica SSL disabilitata...")
+            
+            # Disabilita temporaneamente verifica SSL per il download
+            original_ssl_context = ssl._create_default_https_context
+            ssl._create_default_https_context = ssl._create_unverified_context
+            
+            try:
+                base = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+                print("   ✅ Pesi caricati con successo")
+            except Exception as e2:
+                print(f"   ❌ Fallito anche senza verifica SSL: {e2}")
+                print("   ⚠️  Uso ResNet18 senza pesi pre-addestrati (prestazioni ridotte)")
+                base = resnet18(weights=None)
+            finally:
+                # Ripristina contesto SSL originale
+                ssl._create_default_https_context = original_ssl_context
+        
         # Rimuovi layer finali (avgpool e fc), mantieni solo encoder
         self.encoder = nn.Sequential(*list(base.children())[:-2])
         
@@ -256,7 +282,7 @@ def align_image(image_path, reference_path=None, crop_box=None):
     # Allinea usando omografia (come preprocess_alignment.py)
     template = cv2.imread(str(reference_path), cv2.IMREAD_COLOR)
     if template is None:
-        raise FileNotFoundError(f"Could not read reference: {reference_path}")
+        raise FileNotFoundError(f"Could not read reference: {image_path}")
     
     template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -462,6 +488,25 @@ def classify_connector(image_path, connector_name, occ_model, efficientad_models
             return "OK", error, heatmap, reconstructed_np
 
 # ============================================================================
+# CONFIGURAZIONE THRESHOLD MULTIPLIER
+# ============================================================================
+
+# Moltiplicatori per threshold per connettore (modificabili)
+# Valore di default: 1.0 (usa threshold originale)
+# Per conn3: 3.5 / 2.5 = 1.4 (aumenta threshold del 40%)
+THRESHOLD_MULTIPLIERS = {
+    'conn1': 1.0,
+    'conn2': 1.0,
+    'conn3': 1.4,  # 3.5 / 2.5 = 1.4 (threshold originale era calcolato con 2.5)
+    'conn4': 1.0,
+    'conn5': 1.0,
+    'conn6': 1.0,
+    'conn7': 1.2,
+    'conn8': 1.4,
+    'conn9': 1.0,
+}
+
+# ============================================================================
 # INTERFACCIA GRAFICA
 # ============================================================================
 
@@ -469,8 +514,8 @@ class BekoDetectionSystem:
     def __init__(self, root):
         self.root = root
         self.root.title("BEKO DETECTION SYSTEM")
-        self.root.geometry("1400x900")
-        self.root.configure(bg='#2b2b2b')
+        self.root.geometry("1600x1000")
+        self.root.configure(bg='#ffffff')
         
         # Variabili
         self.image_path = None
@@ -487,6 +532,10 @@ class BekoDetectionSystem:
         self.project_root = Path(__file__).parent.parent
         self.models_dir = self.project_root / "Training" / "models"
         self.roi_config_path = self.project_root / "Codice" / "roi_config.json"
+        
+        # Paths logo
+        self.logo_polimi_path = self.project_root / "Logo polimi.png"
+        self.logo_beko_path = self.project_root / "Logo beko.jpg"
         
         # Paths per riferimento e crop box (per allineamento)
         # Cerca automaticamente un'immagine di riferimento
@@ -516,132 +565,213 @@ class BekoDetectionSystem:
         self.print_threshold_info()
     
     def setup_ui(self):
-        # Header
-        header_frame = tk.Frame(self.root, bg='#1e1e1e', height=80)
+        # Header con logo
+        header_frame = tk.Frame(self.root, bg='#ffffff', height=120)
         header_frame.pack(fill=tk.X, padx=0, pady=0)
         header_frame.pack_propagate(False)
         
+        # Container per logo e titolo
+        header_content = tk.Frame(header_frame, bg='#ffffff')
+        header_content.pack(fill=tk.BOTH, expand=True, padx=30, pady=15)
+        
+        # Logo sinistra (Politecnico)
+        if self.logo_polimi_path.exists():
+            try:
+                logo_polimi_img = Image.open(self.logo_polimi_path)
+                logo_polimi_img = logo_polimi_img.resize((200, 65), Image.Resampling.LANCZOS)
+                logo_polimi_photo = ImageTk.PhotoImage(logo_polimi_img)
+                logo_polimi_label = tk.Label(
+                    header_content,
+                    image=logo_polimi_photo,
+                    bg='#ffffff'
+                )
+                logo_polimi_label.image = logo_polimi_photo  # Keep a reference
+                logo_polimi_label.pack(side=tk.LEFT, padx=(0, 20))
+            except Exception as e:
+                print(f"⚠️  Errore caricamento logo Politecnico: {e}")
+        
+        # Titolo centrale
+        title_frame = tk.Frame(header_content, bg='#ffffff')
+        title_frame.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
+        
         title_label = tk.Label(
-            header_frame,
+            title_frame,
             text="BEKO DETECTION SYSTEM",
-            font=("Arial", 28, "bold"),
-            bg='#1e1e1e',
-            fg='#00ff00'
+            font=("Arial", 32, "bold"),
+            bg='#ffffff',
+            fg='#1a1a1a'
         )
-        title_label.pack(pady=20)
+        title_label.pack()
+        
+        group_label = tk.Label(
+            title_frame,
+            text="Group 3 • Ready to Use Software",
+            font=("Arial", 20, "bold"),
+            bg='#ffffff',
+            fg='#007bff'
+        )
+        group_label.pack(pady=(5, 0))
+        
+        subtitle_label = tk.Label(
+            title_frame,
+            text="PCB Connector Quality Control",
+            font=("Arial", 14),
+            bg='#ffffff',
+            fg='#666666'
+        )
+        subtitle_label.pack(pady=(5, 10))
+        
+        # Logo destra (Beko)
+        if self.logo_beko_path.exists():
+            try:
+                logo_beko_img = Image.open(self.logo_beko_path)
+                # Mantieni aspect ratio
+                aspect = logo_beko_img.width / logo_beko_img.height
+                new_height = 65
+                new_width = int(new_height * aspect)
+                logo_beko_img = logo_beko_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                logo_beko_photo = ImageTk.PhotoImage(logo_beko_img)
+                logo_beko_label = tk.Label(
+                    header_content,
+                    image=logo_beko_photo,
+                    bg='#ffffff'
+                )
+                logo_beko_label.image = logo_beko_photo  # Keep a reference
+                logo_beko_label.pack(side=tk.RIGHT, padx=(20, 0))
+            except Exception as e:
+                print(f"⚠️  Errore caricamento logo Beko: {e}")
+        
+        # Separatore
+        separator = tk.Frame(self.root, bg='#e0e0e0', height=2)
+        separator.pack(fill=tk.X, padx=0, pady=0)
         
         # Main container
-        main_frame = tk.Frame(self.root, bg='#2b2b2b')
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        main_frame = tk.Frame(self.root, bg='#f5f5f5')
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
         
-        # Left panel - Upload
-        left_panel = tk.Frame(main_frame, bg='#2b2b2b', width=400)
-        left_panel.pack(side=tk.LEFT, fill=tk.BOTH, padx=(0, 10))
+        # Left panel - Upload e Statistiche
+        left_panel = tk.Frame(main_frame, bg='#ffffff', width=380)
+        left_panel.pack(side=tk.LEFT, fill=tk.BOTH, padx=(0, 20))
         left_panel.pack_propagate(False)
         
         # Upload area
-        upload_frame = tk.Frame(left_panel, bg='#3b3b3b', relief=tk.RAISED, bd=2)
-        upload_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        upload_frame = tk.Frame(left_panel, bg='#f8f9fa', relief=tk.FLAT, bd=0)
+        upload_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
+        
+        upload_title = tk.Label(
+            upload_frame,
+            text="Load Image",
+            font=("Arial", 14, "bold"),
+            bg='#f8f9fa',
+            fg='#1a1a1a'
+        )
+        upload_title.pack(pady=(15, 10))
+        
+        upload_inner = tk.Frame(upload_frame, bg='#ffffff', relief=tk.SOLID, bd=2)
+        upload_inner.pack(fill=tk.BOTH, expand=True, padx=15, pady=15, ipady=40)
         
         upload_label = tk.Label(
-            upload_frame,
-            text="📁 Trascina immagine qui\n\noppure\n\n🖱️  Clicca per selezionare",
-            font=("Arial", 16),
-            bg='#3b3b3b',
-            fg='#ffffff',
-            pady=60,
-            justify=tk.CENTER
+            upload_inner,
+            text="📁 Drag image here\n\nor\n\n🖱️  Click to select",
+            font=("Arial", 13),
+            bg='#ffffff',
+            fg='#666666',
+            justify=tk.CENTER,
+            cursor='hand2'
         )
         upload_label.pack(expand=True)
         
         # Bind drag & drop
-        upload_frame.drop_target_register(DND_FILES)
-        upload_frame.dnd_bind('<<Drop>>', self.on_drop)
+        upload_inner.drop_target_register(DND_FILES)
+        upload_inner.dnd_bind('<<Drop>>', self.on_drop)
         upload_label.bind("<Button-1>", self.on_click_select)
-        upload_frame.bind("<Button-1>", self.on_click_select)
+        upload_inner.bind("<Button-1>", self.on_click_select)
         
-        # Status (più visibile)
-        status_frame = tk.Frame(left_panel, bg='#2b2b2b')
-        status_frame.pack(fill=tk.X, pady=8)
+        # Status
+        status_frame = tk.Frame(left_panel, bg='#ffffff')
+        status_frame.pack(fill=tk.X, pady=(0, 15))
         
         self.status_label = tk.Label(
             status_frame,
-            text="✅ Pronto",
-            font=("Arial", 12, "bold"),
-            bg='#2b2b2b',
-            fg='#00ff00',
+            text="✅ System ready",
+            font=("Arial", 11),
+            bg='#ffffff',
+            fg='#28a745',
             anchor='w'
         )
-        self.status_label.pack(fill=tk.X)
+        self.status_label.pack(fill=tk.X, pady=(0, 5))
         
-        # Info riferimento (più leggibile)
-        ref_info = f"📎 Rif: {Path(self.reference_path).name if self.reference_path else 'Nessuno (assume allineata)'}"
+        # Info riferimento
+        ref_info = f"📎 Reference: {Path(self.reference_path).name if self.reference_path else 'None (assumes aligned)'}"
         self.ref_label = tk.Label(
             status_frame,
             text=ref_info,
             font=("Arial", 9),
-            bg='#2b2b2b',
-            fg='#aaaaaa',
+            bg='#ffffff',
+            fg='#999999',
             anchor='w'
         )
-        self.ref_label.pack(fill=tk.X, pady=(2, 0))
+        self.ref_label.pack(fill=tk.X)
         
-        # Process button (più visibile)
+        # Process button
         self.process_btn = tk.Button(
             left_panel,
-            text="🔍 ANALIZZA IMMAGINE",
-            font=("Arial", 16, "bold"),
-            bg='#00ff00',
-            fg='#000000',
+            text="🔍 ANALYZE IMAGE",
+            font=("Arial", 14, "bold"),
+            bg='#007bff',
+            fg='#ffffff',
             command=self.process_image,
             state=tk.DISABLED,
-            pady=15,
-            relief=tk.RAISED,
-            bd=3,
-            cursor='hand2'
+            pady=12,
+            relief=tk.FLAT,
+            bd=0,
+            cursor='hand2',
+            activebackground='#0056b3',
+            activeforeground='#ffffff'
         )
-        self.process_btn.pack(fill=tk.X, pady=12)
+        self.process_btn.pack(fill=tk.X, pady=(0, 15))
         
         # Statistics
-        stats_frame = tk.Frame(left_panel, bg='#3b3b3b', relief=tk.RAISED, bd=2)
+        stats_frame = tk.Frame(left_panel, bg='#f8f9fa', relief=tk.FLAT, bd=0)
         stats_frame.pack(fill=tk.BOTH, expand=True)
         
         stats_title = tk.Label(
             stats_frame,
-            text="📊 STATISTICHE",
+            text="📊 Statistics",
             font=("Arial", 14, "bold"),
-            bg='#3b3b3b',
-            fg='white'
+            bg='#f8f9fa',
+            fg='#1a1a1a',
+            anchor='w'
         )
-        stats_title.pack(pady=12)
+        stats_title.pack(pady=(0, 10), padx=15, fill=tk.X)
         
         self.stats_text = tk.Text(
             stats_frame,
-            font=("Courier", 11),
-            bg='#1e1e1e',
-            fg='#ffffff',
+            font=("Courier", 10),
+            bg='#ffffff',
+            fg='#1a1a1a',
             wrap=tk.WORD,
             state=tk.DISABLED,
             relief=tk.FLAT,
             bd=0,
-            padx=12,
-            pady=12
+            padx=15,
+            pady=15
         )
-        self.stats_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.stats_text.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 15))
         
         # Right panel - Results
-        right_panel = tk.Frame(main_frame, bg='#2b2b2b')
+        right_panel = tk.Frame(main_frame, bg='#ffffff')
         right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         
-        # Matplotlib figure (più grande per migliore leggibilità)
-        self.fig = plt.figure(figsize=(14, 10), facecolor='#1e1e1e', dpi=100)
+        # Matplotlib figure con sfondo bianco (più grande per immagini più grandi)
+        self.fig = plt.figure(figsize=(18, 14), facecolor='#ffffff', dpi=100)
         self.canvas = FigureCanvasTkAgg(self.fig, master=right_panel)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         
         # Initial empty plot
-        ax = self.fig.add_subplot(111, facecolor='#2b2b2b')
-        ax.text(0.5, 0.5, "Carica un'immagine per iniziare", 
-                ha='center', va='center', fontsize=16, color='white',
+        ax = self.fig.add_subplot(111, facecolor='#ffffff')
+        ax.text(0.5, 0.5, "Load an image to start analysis", 
+                ha='center', va='center', fontsize=16, color='#999999',
                 transform=ax.transAxes)
         ax.axis('off')
         self.canvas.draw()
@@ -649,7 +779,7 @@ class BekoDetectionSystem:
     def load_models(self):
         """Carica i modelli addestrati (EfficientAD-M o autoencoder legacy)."""
         try:
-            self.status_label.config(text="Caricamento modelli...", fg='yellow')
+            self.status_label.config(text="⏳ Loading models...", fg='#ffc107')
             self.root.update()
             
             # Carica occlusion model
@@ -682,6 +812,12 @@ class BekoDetectionSystem:
                     # Carica threshold
                     threshold = np.load(threshold_path)
                     
+                    # Applica moltiplicatore se configurato
+                    multiplier = THRESHOLD_MULTIPLIERS.get(connector_name, 1.0)
+                    if multiplier != 1.0:
+                        threshold = threshold * multiplier
+                        print(f"  ⚙️  Threshold {connector_name} moltiplicato per {multiplier:.2f} (nuovo: {threshold:.6f})")
+                    
                     self.efficientad_models[connector_name] = (teacher, student, threshold)
                     loaded_eff += 1
                 else:
@@ -690,7 +826,7 @@ class BekoDetectionSystem:
             if loaded_eff > 0:
                 # Usa EfficientAD-M
                 self.use_efficientad = True
-                self.status_label.config(text=f"✅ Modelli caricati ({loaded_eff} EfficientAD-M)", fg='#00ff00')
+                self.status_label.config(text=f"✅ Models loaded ({loaded_eff} EfficientAD-M)", fg='#28a745')
                 print(f"✅ Caricati {loaded_eff} modelli EfficientAD-M")
             else:
                 # Fallback: prova autoencoder (legacy)
@@ -726,11 +862,11 @@ class BekoDetectionSystem:
                     else:
                         raise FileNotFoundError("Nessun modello trovato (né EfficientAD-M né autoencoder)")
                 
-                self.status_label.config(text=f"✅ Modelli caricati ({loaded_ae} AE legacy)", fg='#00ff00')
+                self.status_label.config(text=f"✅ Models loaded ({loaded_ae} AE legacy)", fg='#28a745')
                 print(f"✅ Caricati {loaded_ae} modelli AE (legacy)")
         except Exception as e:
             messagebox.showerror("Errore", f"Errore caricamento modelli:\n{e}")
-            self.status_label.config(text="❌ Errore caricamento modelli", fg='red')
+            self.status_label.config(text="❌ Error loading models", fg='#dc3545')
     
     def print_threshold_info(self):
         """Stampa informazioni sui thresholds per debug."""
@@ -742,27 +878,10 @@ class BekoDetectionSystem:
             print(f"\n📊 THRESHOLDS EFFICIENTAD-M (per connettore):")
             for conn_name, (_, _, threshold) in sorted(self.efficientad_models.items()):
                 print(f"  {conn_name}: {threshold:.6f}")
-            print(f"\n📝 COME FUNZIONA:")
-            print(f"  1. STEP 1 - Classificatore OCCLUSION vs VISIBLE:")
-            print(f"     • Se OCCLUSION → ritorna 'OCCLUSION'")
-            print(f"     • Se VISIBLE → procede a STEP 2")
-            print(f"\n  2. STEP 2 - EfficientAD-M per Anomaly Detection:")
-            print(f"     • Teacher: ResNet18 pre-addestrato (congelato)")
-            print(f"     • Student: ResNet18 addestrato SOLO su immagini OK")
-            print(f"     • Anomaly score: differenza tra feature Teacher e Student (max)")
-            print(f"     • Usa il threshold specifico del connettore per decidere OK/KO")
         elif self.ae_models:
             print(f"\n📊 THRESHOLDS AUTOENCODER (per connettore) - LEGACY:")
             for conn_name, (_, threshold) in sorted(self.ae_models.items()):
                 print(f"  {conn_name}: {threshold:.6f}")
-            print(f"\n📝 COME FUNZIONA:")
-            print(f"  1. STEP 1 - Classificatore OCCLUSION vs VISIBLE:")
-            print(f"     • Se OCCLUSION → ritorna 'OCCLUSION'")
-            print(f"     • Se VISIBLE → procede a STEP 2")
-            print(f"\n  2. STEP 2 - Autoencoder per Anomaly Detection (LEGACY):")
-            print(f"     • Ogni connettore ha il suo autoencoder addestrato SOLO su immagini OK")
-            print(f"     • Calcola errore di ricostruzione (MSE tra input e output)")
-            print(f"     • Usa il threshold specifico del connettore per decidere OK/KO")
         
         print(f"{'='*60}\n")
     
@@ -771,18 +890,18 @@ class BekoDetectionSystem:
         files = self.root.tk.splitlist(event.data)
         if files:
             self.image_path = files[0].strip('{}')
-            self.status_label.config(text=f"Immagine caricata: {Path(self.image_path).name}", fg='#00ff00')
+            self.status_label.config(text=f"📁 Image loaded: {Path(self.image_path).name}", fg='#28a745')
             self.process_btn.config(state=tk.NORMAL)
     
     def on_click_select(self, event):
         """Apre file dialog per selezionare immagine."""
         file_path = filedialog.askopenfilename(
-            title="Seleziona immagine PCB",
+            title="Select PCB Image",
             filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")]
         )
         if file_path:
             self.image_path = file_path
-            self.status_label.config(text=f"Immagine caricata: {Path(self.image_path).name}", fg='#00ff00')
+            self.status_label.config(text=f"📁 Image loaded: {Path(self.image_path).name}", fg='#28a745')
             self.process_btn.config(state=tk.NORMAL)
     
     def process_image(self):
@@ -791,7 +910,7 @@ class BekoDetectionSystem:
             return
         
         self.process_btn.config(state=tk.DISABLED)
-        self.status_label.config(text="Elaborazione in corso...", fg='yellow')
+        self.status_label.config(text="⏳ Processing...", fg='#ffc107')
         self.root.update()
         
         # Esegui in thread per non bloccare UI
@@ -803,7 +922,7 @@ class BekoDetectionSystem:
         """Thread per processare l'immagine."""
         try:
             # 1. Allinea immagine (usa riferimento e crop box se disponibili)
-            self.root.after(0, lambda: self.status_label.config(text="Allineamento immagine...", fg='yellow'))
+            self.root.after(0, lambda: self.status_label.config(text="⏳ Aligning image...", fg='#ffc107'))
             
             # Determina se usare riferimento o assumere già allineata
             ref_path = self.reference_path if self.reference_path and self.reference_path.exists() else None
@@ -811,27 +930,27 @@ class BekoDetectionSystem:
             
             if ref_path:
                 self.root.after(0, lambda: self.status_label.config(
-                    text=f"Allineamento con riferimento: {Path(ref_path).name}...", fg='yellow'))
+                    text=f"⏳ Aligning with reference: {Path(ref_path).name}...", fg='#ffc107'))
             
             self.aligned_image = align_image(self.image_path, reference_path=ref_path, crop_box=crop)
             
             # 2. Carica ROI config
             if not self.roi_config_path.exists():
-                raise FileNotFoundError(f"ROI config non trovato: {self.roi_config_path}")
+                raise FileNotFoundError(f"ROI config not found: {self.roi_config_path}")
             rois = load_roi_config(self.roi_config_path)
             
             # 3. Estrai connettori
-            self.root.after(0, lambda: self.status_label.config(text="Estrazione connettori...", fg='yellow'))
+            self.root.after(0, lambda: self.status_label.config(text="⏳ Extracting connectors...", fg='#ffc107'))
             self.connectors = extract_connectors(self.aligned_image, rois, margin=8)
             
             # 4. Classifica connettori
-            self.root.after(0, lambda: self.status_label.config(text="Classificazione connettori...", fg='yellow'))
+            self.root.after(0, lambda: self.status_label.config(text="⏳ Classifying connectors...", fg='#ffc107'))
             temp_dir = Path(tempfile.mkdtemp())
             self.results = []
             
             for i, conn in enumerate(self.connectors):
                 self.root.after(0, lambda idx=i: self.status_label.config(
-                    text=f"Classificazione {idx+1}/9...", fg='yellow'))
+                    text=f"⏳ Classifying {idx+1}/9...", fg='#ffc107'))
                 
                 temp_path = temp_dir / f"{conn['name']}.png"
                 # Salva crop normalizzato (grayscale) come in Data/connectors/
@@ -865,30 +984,36 @@ class BekoDetectionSystem:
             
             # 5. Visualizza risultati
             self.root.after(0, self.visualize_results)
-            self.root.after(0, lambda: self.status_label.config(text="✅ Analisi completata!", fg='#00ff00'))
+            self.root.after(0, lambda: self.status_label.config(text="✅ Analysis completed!", fg='#28a745'))
             self.root.after(0, lambda: self.process_btn.config(state=tk.NORMAL))
             
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("Errore", f"Errore durante l'elaborazione:\n{e}"))
-            self.root.after(0, lambda: self.status_label.config(text="❌ Errore", fg='red'))
+            self.root.after(0, lambda: self.status_label.config(text="❌ Error", fg='#dc3545'))
             self.root.after(0, lambda: self.process_btn.config(state=tk.NORMAL))
     
     def visualize_results(self):
-        """Visualizza i risultati - solo i 9 connettori."""
+        """Visualizza i risultati - solo i 9 connettori con heatmap migliorata."""
         self.fig.clear()
-        self.fig.set_facecolor('#1e1e1e')
+        self.fig.set_facecolor('#ffffff')
         
-        # Colori più vivaci e contrastati
+        # Colori moderni e puliti
         COLORS = {
-            'OK': (0, 255, 0),           # Verde brillante
-            'KO': (255, 0, 0),           # Rosso brillante
-            'OCCLUSION': (255, 200, 0)   # Giallo/arancione brillante
+            'OK': '#28a745',        # Verde
+            'KO': '#dc3545',        # Rosso
+            'OCCLUSION': '#ffc107'  # Giallo/Ambra
         }
         
+        # Colormap personalizzata per heatmap: giallo (normale) -> rosso (anomalo)
+        # Giallo chiaro per zone normali, rosso intenso per zone anomale
+        colors_heatmap = ['#ffff00', '#ffcc00', '#ff9900', '#ff6600', '#ff3300', '#cc0000']
+        n_bins = 256
+        cmap_heatmap = LinearSegmentedColormap.from_list('anomaly', colors_heatmap, N=n_bins)
         
-        # Grid 3x3 con solo i connettori (più grandi)
+        # Grid 3x3 con solo i connettori
         for idx, r in enumerate(self.results):
             ax = self.fig.add_subplot(3, 3, idx + 1)
+            ax.set_facecolor('#ffffff')
             
             # I crop sono già in grayscale
             if len(r['crop'].shape) == 2:
@@ -897,94 +1022,111 @@ class BekoDetectionSystem:
                 crop_rgb = cv2.cvtColor(r['crop'], cv2.COLOR_BGR2RGB)
                 ax.imshow(crop_rgb)
             
-            # Overlay heatmap se disponibile (solo per OK/KO, non OCCLUSION)
+            # Heatmap migliorata - solo per OK/KO, non OCCLUSION
             if r['heatmap'] is not None:
-                # Resize heatmap se necessario (dovrebbe essere 128x128, ma il crop potrebbe essere diverso)
+                # Resize heatmap se necessario
                 h, w = r['crop'].shape[:2]
                 if r['heatmap'].shape != (h, w):
-                    # Converti a uint8 per cv2.resize, poi riporta a float
-                    heatmap_uint8 = (r['heatmap'] * 255).astype(np.uint8)
-                    heatmap_resized = cv2.resize(heatmap_uint8, (w, h), interpolation=cv2.INTER_LINEAR)
-                    heatmap_resized = heatmap_resized.astype(np.float32) / 255.0
+                    # Mantieni i valori originali, non normalizzare prima del resize
+                    heatmap_resized = cv2.resize(r['heatmap'], (w, h), interpolation=cv2.INTER_LINEAR)
                 else:
-                    heatmap_resized = r['heatmap']
+                    heatmap_resized = r['heatmap'].copy()
                 
-                # Usa scala assoluta basata su threshold invece di normalizzazione per immagine
-                # Questo permette di vedere le differenze reali tra OK e KO
+                # Normalizza heatmap basandosi sul threshold
                 threshold = r.get('threshold')
-                if threshold is not None:
-                    # Scala: 0 = errore basso, threshold = errore medio-alto, 2*threshold = errore molto alto
-                    vmax = max(threshold * 2, heatmap_resized.max())
+                if threshold is not None and threshold > 0:
+                    # Usa threshold come punto di riferimento per la normalizzazione
+                    # Valori sotto threshold/2 = giallo (normale)
+                    # Valori sopra threshold = rosso (anomalo)
+                    # Valori tra threshold/2 e threshold = gradiente giallo->arancione->rosso
+                    
+                    # Normalizza: threshold corrisponde a ~0.6 nella scala 0-1
+                    # Questo permette di vedere sia zone normali (gialle) che anomale (rosse)
+                    vmax = threshold * 1.5  # Soglia massima: 1.5x threshold per vedere anche valori alti
                     vmin = 0
+                    
+                    # Normalizza la heatmap
+                    heatmap_norm = np.clip(heatmap_resized / vmax, 0, 1)
+                    
+                    # Applica una funzione per enfatizzare le zone anomale
+                    # Zone normali (basse) rimangono gialle, zone anomale (alte) diventano rosse
+                    # Usa una funzione per rendere più visibili le differenze
+                    heatmap_norm = np.power(heatmap_norm, 0.8)  # Leggera enfatizzazione
                 else:
-                    # Fallback: usa min-max se threshold non disponibile
+                    # Fallback: normalizzazione min-max
                     vmax = heatmap_resized.max()
                     vmin = heatmap_resized.min()
+                    if vmax > vmin:
+                        heatmap_norm = (heatmap_resized - vmin) / (vmax - vmin)
+                    else:
+                        heatmap_norm = np.zeros_like(heatmap_resized)
                 
-                # Clip e normalizza per visualizzazione
-                heatmap_clipped = np.clip(heatmap_resized, vmin, vmax)
-                if vmax > vmin:
-                    heatmap_norm = (heatmap_clipped - vmin) / (vmax - vmin)
-                else:
-                    heatmap_norm = np.zeros_like(heatmap_clipped)
+                # Mostra SEMPRE la heatmap, non mascherarla
+                # Alpha più alto per zone KO, più basso per OK
+                alpha = 0.5 if r['label'] == 'OK' else 0.65
+                im = ax.imshow(heatmap_norm, cmap=cmap_heatmap, alpha=alpha, interpolation='bilinear', vmin=0, vmax=1)
                 
-                # Overlay heatmap con trasparenza (colori caldi: rosso/giallo = errore alto)
-                # Usa alpha più alto per KO per evidenziare meglio le differenze
-                alpha = 0.7 if r['label'] == 'KO' else 0.5
-                im = ax.imshow(heatmap_norm, cmap='hot', alpha=alpha, interpolation='bilinear', vmin=0, vmax=1)
+                # Aggiungi contorni per evidenziare le zone più anomale (solo se c'è threshold)
+                if threshold is not None and threshold > 0:
+                    # Contorni per zone sopra 70% del threshold (zone molto anomale)
+                    contour_threshold = threshold * 0.7
+                    # Normalizza il threshold per i contorni
+                    contour_level_norm = contour_threshold / (threshold * 1.5)
+                    if contour_level_norm <= 1.0 and heatmap_resized.max() >= contour_threshold:
+                        # Trova i contorni nella heatmap originale
+                        contour_mask = heatmap_resized >= contour_threshold
+                        if contour_mask.any():
+                            # Crea contorni dalla maschera usando XOR invece di sottrazione
+                            dilated = ndimage.binary_dilation(contour_mask)
+                            contours_data = np.logical_xor(dilated, contour_mask).astype(np.float32)
+                            if contours_data.any():
+                                ax.contour(contours_data, levels=[0.5], colors=['darkred'], linewidths=2, alpha=0.9)
             
             ax.axis('off')
-            ax.set_facecolor('#1e1e1e')
             
             # Colore per label
-            color = COLORS[r['label']]
-            color_hex = '#%02x%02x%02x' % color
+            color_hex = COLORS[r['label']]
             
-            # Bordo colorato molto sottile (solo per indicare la classe)
+            # Bordo colorato più spesso e visibile
             for spine in ax.spines.values():
                 spine.set_visible(True)
                 spine.set_color(color_hex)
-                spine.set_linewidth(1)  # Molto sottile
+                spine.set_linewidth(3)
             
-            # Label sopra il crop con errore e threshold info
+            # Label sopra il crop (più piccola e discreta)
             label_text = r['label']
             threshold = r.get('threshold')
-            if r['error'] > 0:
-                # Mostra errore e se è sopra/sotto threshold
-                if threshold is not None:
-                    if r['label'] == 'KO' and r['error'] > threshold:
-                        label_text += f"\n({r['error']:.4f} > {threshold:.4f})"
-                    elif r['label'] == 'OK' and r['error'] <= threshold:
-                        label_text += f"\n({r['error']:.4f} ≤ {threshold:.4f})"
-                    else:
-                        label_text += f"\n({r['error']:.4f})"
-                else:
-                    label_text += f"\n({r['error']:.4f})"
+            if r['error'] > 0 and threshold is not None:
+                if r['label'] == 'KO':
+                    label_text += f"\n{r['error']:.3f}"
+                elif r['label'] == 'OK':
+                    label_text += f"\n{r['error']:.3f}"
             
-            # Label piccola e discreta sopra
-            ax.text(0.5, 0.98, label_text,
+            # Label con sfondo colorato (più piccola)
+            ax.text(0.5, 0.97, label_text,
                    transform=ax.transAxes,
-                   fontsize=8, fontweight='bold',
+                   fontsize=7, fontweight='bold',
                    color='white',
                    ha='center', va='top',
-                   bbox=dict(boxstyle='round,pad=0.2',
+                   bbox=dict(boxstyle='round,pad=0.25',
                            facecolor=color_hex,
                            edgecolor='white',
-                           linewidth=0.5,
-                           alpha=0.7))
+                           linewidth=1,
+                           alpha=0.85))
             
-            # Nome connettore piccolo in basso
-            ax.text(0.5, 0.02, r['name'],
+            # Nome connettore in basso (più piccolo)
+            ax.text(0.5, 0.03, r['name'],
                    transform=ax.transAxes,
-                   fontsize=8,
-                   color='white',
+                   fontsize=7,
+                   color='#1a1a1a',
                    ha='center', va='bottom',
-                   bbox=dict(boxstyle='round,pad=0.15',
-                           facecolor='black',
-                           edgecolor='none',
-                           alpha=0.6))
+                   bbox=dict(boxstyle='round,pad=0.2',
+                           facecolor='white',
+                           edgecolor='#cccccc',
+                           linewidth=0.8,
+                           alpha=0.85))
         
-        plt.tight_layout(pad=2.0, rect=[0, 0, 1, 0.96])
+        plt.tight_layout(pad=2.0, rect=[0, 0, 1, 0.98])
         self.canvas.draw()
         
         # Aggiorna statistiche
@@ -999,50 +1141,18 @@ class BekoDetectionSystem:
         stats_text = f"✅ OK:        {ok_count}/9\n"
         stats_text += f"❌ KO:        {ko_count}/9\n"
         stats_text += f"⚠️  OCCLUSION: {occ_count}/9\n\n"
-        stats_text += "=" * 40 + "\n"
-        if hasattr(self, 'threshold'):
-            stats_text += f"Threshold: {self.threshold:.6f}\n"
-        stats_text += "=" * 40 + "\n\n"
-        
-        # Calcola statistiche heatmap per debug
-        heatmap_errors = []
-        for r in self.results:
-            if r['heatmap'] is not None:
-                heatmap_errors.append({
-                    'name': r['name'],
-                    'mean': r['heatmap'].mean(),
-                    'max': r['heatmap'].max(),
-                    'std': r['heatmap'].std(),
-                    'label': r['label']
-                })
+        stats_text += "=" * 35 + "\n\n"
         
         for r in self.results:
             threshold = r.get('threshold')
-            stats_text += f"{r['name']}: {r['label']}"
+            stats_text += f"{r['name']}: {r['label']}\n"
             if r['error'] > 0:
-                stats_text += f"\n  Errore medio: {r['error']:.6f}"
+                stats_text += f"  Score: {r['error']:.6f}\n"
                 if threshold is not None:
-                    if r['error'] > threshold:
-                        stats_text += f" > {threshold:.6f} (KO)"
-                    else:
-                        stats_text += f" ≤ {threshold:.6f} (OK)"
-                    stats_text += f"\n  Threshold: {threshold:.6f}"
-                # Aggiungi info heatmap se disponibile
+                    stats_text += f"  Threshold: {threshold:.6f}\n"
                 if r['heatmap'] is not None:
-                    stats_text += f"\n  Heatmap: max={r['heatmap'].max():.4f}, mean={r['heatmap'].mean():.4f}, std={r['heatmap'].std():.4f}"
-            stats_text += "\n\n"
-        
-        # Debug: confronta errori OK vs KO
-        if heatmap_errors:
-            ok_errors = [e['mean'] for e in heatmap_errors if e['label'] == 'OK']
-            ko_errors = [e['mean'] for e in heatmap_errors if e['label'] == 'KO']
-            if ok_errors and ko_errors:
-                stats_text += "=" * 40 + "\n"
-                stats_text += "DEBUG - Confronto Errori:\n"
-                stats_text += f"  OK:  mean={np.mean(ok_errors):.6f}, max={np.max(ok_errors):.6f}\n"
-                stats_text += f"  KO:  mean={np.mean(ko_errors):.6f}, max={np.max(ko_errors):.6f}\n"
-                stats_text += f"  Diff: {np.mean(ko_errors) - np.mean(ok_errors):.6f}\n"
-                stats_text += "=" * 40 + "\n"
+                    stats_text += f"  Heatmap: max={r['heatmap'].max():.4f}, mean={r['heatmap'].mean():.4f}\n"
+            stats_text += "\n"
         
         self.stats_text.config(state=tk.NORMAL)
         self.stats_text.delete(1.0, tk.END)
@@ -1065,4 +1175,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

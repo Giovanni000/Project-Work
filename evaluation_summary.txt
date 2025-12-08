@@ -1,0 +1,25 @@
+EVALUATION SUMMARY
+============================================================
+
+Overall Accuracy: 95.13%
+Total Images: 2853
+Correct Predictions: 2714
+
+Confusion Matrix:
+predicted_label   KO  OCCLUSION    OK   All
+true_label                                 
+KO                21          1     3    25
+OCCLUSION         56        393    36   485
+OK                39          4  2300  2343
+All              116        398  2339  2853
+
+Per-Connector Statistics:
+conn1: 97.16% (308/317)
+conn2: 98.11% (311/317)
+conn3: 100.00% (317/317)
+conn4: 94.01% (298/317)
+conn5: 96.85% (307/317)
+conn6: 88.01% (279/317)
+conn7: 89.59% (284/317)
+conn8: 98.11% (311/317)
+conn9: 94.32% (299/317)
